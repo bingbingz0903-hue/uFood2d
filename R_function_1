@@ -1,0 +1,577 @@
+# =============================================================================
+# Main preprocessing function for the uFood2d urban pluvial flood simulation model
+#
+# Purpose:
+#   Generate model-ready CSV files from raster datasets, including rainfall,
+#   infiltration, drainage capacity, and initial state tables.
+#
+# Workflow:
+#   1. Read raster datasets
+#   2. Check raster quality, align rasters to the buffer DEM grid, and verify
+#      spatial constraints
+#   3. Generate grid cell IDs for the buffer domain
+#   4. Generate spatiotemporal rainfall distribution using the Chicago hyetograph
+#   5. Calculate Horton infiltration time series
+#   6. Extract drainage capacity
+#   7. Prepare the initial model state table
+# =============================================================================
+#' Prepare Initial Input Data for the uFood2d Urban Flood Simulation Model
+#'
+#' This function prepares raster-based input data for the uFood2d urban pluvial
+#' flood simulation model. It reads the buffer-domain DEM, computational-domain
+#' DEM, imperviousness raster, and drainage-capacity raster; performs raster
+#' quality checks and spatial consistency checks; aligns all non-buffer rasters
+#' to the buffer DEM grid; generates grid cell IDs and computational-domain
+#' flags; creates rainfall time series based on the Chicago hyetograph; computes
+#' Horton infiltration time series; extracts drainage capacity; and writes
+#' model-ready CSV files.
+#'
+#' The raster checking and alignment procedure is handled as a separate internal
+#' preprocessing section. This procedure checks whether all input rasters use an
+#' Albers projected coordinate reference system, verifies whether DEM,
+#' imperviousness, and drainage-capacity values fall within reasonable ranges,
+#' aligns the computational-domain DEM, imperviousness raster, and drainage raster
+#' to the buffer DEM grid, checks whether the computational-domain area exceeds
+#' the allowed threshold, and verifies whether the buffer domain extends at least
+#' two cells beyond the valid computational domain.
+#'
+#' The coordinate columns in the output tables are named `lon` and `lat` for
+#' compatibility with the uFood2d input format. Because this function requires an
+#' Albers projected coordinate reference system, these columns represent projected
+#' x and y coordinates rather than geographic longitude and latitude.
+#'
+#' @param buffer_dem Character. File path to the DEM raster of the buffer domain.
+#' @param inner_dem Character. File path to the DEM raster of the computational domain.
+#' @param impervious Character. File path to the imperviousness raster. Values should range from 0 to 1.
+#' @param drainage Character. File path to the drainage capacity raster. Values should range from 0 to 1.
+#' @param max_area_km2 Numeric. Maximum allowed area of the computational domain, in square kilometers. Default is 5500.
+#' @param max_hour_rain_mm Numeric. Target accumulated rainfall depth for one hour, in millimeters.
+#' @param event_duration_min Numeric. Total rainfall event duration, in minutes.
+#' @param dt Numeric. Rainfall and infiltration time step, in minutes.
+#' @param r Numeric. Peak position coefficient of the Chicago hyetograph. Must be greater than 0 and less than 1.
+#' @param A Numeric. Parameter A of the rainfall intensity formula.
+#' @param C Numeric. Parameter C of the rainfall intensity formula.
+#' @param b Numeric. Parameter b of the rainfall intensity formula.
+#' @param n Numeric. Parameter n of the rainfall intensity formula.
+#' @param P Numeric. Return period parameter of the rainfall intensity formula.
+#' @param f0 Numeric. Initial infiltration rate of the Horton model, in mm/h.
+#' @param fc Numeric. Stable infiltration rate of the Horton model, in mm/h.
+#' @param k Numeric. Decay coefficient of the Horton model, in h^-1.
+#' @param dx Numeric. Grid resolution in the x direction, in meters.
+#' @param dy Numeric. Grid resolution in the y direction, in meters.
+#' @param h0 Numeric. Initial water depth. Default is 1e-6.
+#' @param output_dir Character. Directory where output CSV files will be written. Default is `"."`.
+#' @param prefix Character. Prefix used for output file names. Default is `"uFood2d"`.
+#'
+#' @details
+#' The function uses the buffer DEM as the reference grid. The computational DEM
+#' is aligned to this grid using nearest-neighbor resampling because it is mainly
+#' used as a valid-cell mask. Imperviousness and drainage-capacity rasters are
+#' aligned using bilinear interpolation because they represent continuous values.
+#'
+#' Rainfall is first generated as a temporal series using the Chicago hyetograph.
+#' The temporal rainfall depth is then allocated to each computational cell using
+#' spatial rainfall weights extracted from the built-in `rain_sum.tif` raster.
+#' The extracted weights are normalized by their mean so that the spatial average
+#' rainfall depth remains consistent with the target rainfall time series.
+#'
+#' Horton infiltration is calculated from the parameters `f0`, `fc`, and `k`.
+#' Cell-level infiltration depth is adjusted by the pervious fraction, which is
+#' calculated as `1 - imperviousness`.
+#'
+#' @return A list with the following elements:
+#' \describe{
+#'   \item{grid_base}{A data frame containing the base grid information of the buffer domain.}
+#'   \item{rain_series}{A data frame containing the total rainfall time series.}
+#'   \item{rain_spatial}{A data frame containing grid-cell-level rainfall time series for the computational domain.}
+#'   \item{infiltration}{A data frame containing grid-cell-level Horton infiltration time series for the computational domain.}
+#'   \item{drainage}{A data frame containing grid-cell-level drainage capacity information.}
+#'   \item{state_tbl}{A tibble containing the initial state table for the uFood2d model.}
+#' }
+#' @export
+prepare_state <- function(buffer_dem, inner_dem, impervious, drainage, max_area_km2 = 5500,
+                          max_hour_rain_mm, event_duration_min, dt,
+                          r,
+                          A, C, b, n, P,
+                          f0, fc, k,
+                          dx, dy, h0 = 1e-6,
+                          output_dir = ".",
+                          prefix = "uFood2d"
+) {
+  # ---------------------------------------------------------------------------
+  # 0. General helper functions
+  # ---------------------------------------------------------------------------
+  # Check whether total duration can be divided by the time step.
+  is_whole_multiple <- function(total, step, tol = 1e-9) {
+    abs(total / step - round(total / step)) <= tol
+  }
+  # ---------------------------------------------------------------------------
+  # 1. 读取栅格数据
+  # ---------------------------------------------------------------------------
+  buffer_dem <- terra::rast(buffer_dem)
+  inner_dem <- terra::rast(inner_dem)
+  impervious <- terra::rast(impervious)
+  drainage <- terra::rast(drainage)
+
+  # ---------------------------------------------------------------------------
+  # 2.栅格质量检查
+  # ---------------------------------------------------------------------------
+  check_rasters <- function(buffer_dem, inner_dem, impervious, drainage, max_area_km2) {
+
+    # 检查一：检查 Albers 投影
+    check_albers_crs <- function(x, nm) {
+      wkt <- terra::crs(x)
+
+      if (is.na(wkt) || wkt == "") {
+        stop(nm, " 缺少 CRS")
+      }
+      if (terra::is.lonlat(x)) {
+        stop(nm, " 的 CRS 是地理坐标系，不是 Albers 投影")
+      }
+      if (!grepl("Albers|aea", wkt, ignore.case = TRUE)) {
+        stop(nm, " 的 CRS 不是 Albers 投影")
+      }
+      TRUE
+    }
+    check_albers_crs(buffer_dem, "缓冲区 DEM")
+    check_albers_crs(inner_dem, "计算区 DEM")
+    check_albers_crs(impervious, "不透水率栅格")
+    check_albers_crs(drainage, "排水能力栅格")
+
+    message("✓ 所有输入栅格均为 Albers 投影")
+
+    # 检查二 ：检查栅格值域
+    check_value_range <- function(x, nm, lo, hi) {
+      rmin <- terra::global(x, "min", na.rm = TRUE)[1, 1]
+      rmax <- terra::global(x, "max", na.rm = TRUE)[1, 1]
+
+      if (!is.finite(rmin) || !is.finite(rmax)) {
+        stop(nm, " 全部为 NA 或无法计算有效值域")
+      }
+
+      if (rmin < lo - 1e-9 || rmax > hi + 1e-9) {
+        stop(sprintf(
+          "%s 值域 [%.4f, %.4f] 超出合理范围 [%.0f, %.0f]",
+          nm, rmin, rmax, lo, hi
+        ))
+      }
+      TRUE
+    }
+    check_value_range(buffer_dem, "缓冲区 DEM", -500, 5000)
+    check_value_range(inner_dem, "计算区 DEM", -500, 5000)
+    check_value_range(impervious, "不透水率", 0, 1)
+    check_value_range(drainage, "排水能力", 0, 1)
+
+    message("✓ 所有输入栅格值域合理")
+
+    # 检查三：检查分辨率 对齐栅格
+    same_grid <- function(x, template, tol = 1e-9) {
+      same_nrow <- terra::nrow(x) == terra::nrow(template)
+      same_ncol <- terra::ncol(x) == terra::ncol(template)
+      same_res <- all(abs(terra::res(x) - terra::res(template)) < tol)
+      same_ext <- all(abs(as.vector(terra::ext(x)) - as.vector(terra::ext(template))) < tol)
+
+      same_nrow && same_ncol && same_res && same_ext
+    }
+
+    # Align a raster to the buffer DEM grid.
+    align_to_buffer <- function(x, template, nm, method = "near") {
+      if (!terra::same.crs(x, template)) {
+        message(nm, " CRS differs from buffer DEM. Projecting and aligning to buffer grid...")
+        return(terra::project(x, template, method = method))
+      }
+      if (!same_grid(x, template)) {
+        message(nm, " grid differs from buffer DEM. Resampling to buffer grid...")
+        return(terra::resample(x, template, method = method))
+      }
+      x
+    }
+
+    inner_dem <- align_to_buffer(x = inner_dem,template = buffer_dem, nm = "Computational DEM",  method = "near")
+    impervious <- align_to_buffer(x = impervious, template = buffer_dem, nm = "Imperviousness raster", method = "bilinear")
+    drainage <- align_to_buffer(x = drainage, template = buffer_dem, nm = "Drainage capacity raster",method = "bilinear")
+
+    message("✓ 所有栅格已对齐到缓冲区 DEM 网格")
+
+    # 检查四：计算区面积检查
+    res_ref <- terra::res(buffer_dem)
+    cell_area_m2 <- prod(res_ref)
+
+    inner_valid <- !is.na(inner_dem)
+    n_valid <- terra::global(inner_valid, "sum", na.rm = TRUE)[1, 1]
+    n_valid <- as.numeric(n_valid)
+
+    if (!is.finite(n_valid) || n_valid <= 0) {
+      stop("计算区 DEM 中没有有效像元")
+    }
+    area_km2 <- n_valid * cell_area_m2 / 1e6
+    if (area_km2 > max_area_km2) {
+      stop(sprintf("计算区面积 %.2f km² > %.2f km²", area_km2, max_area_km2))
+    }
+
+    message(sprintf("✓ 计算区面积 %.2f km²，未超限", area_km2))
+
+    # 检查五：缓冲区外扩检查
+    ext_buf <- terra::ext(buffer_dem)
+    ext_inn <- terra::ext(terra::trim(inner_dem))
+
+    req_x <- 2 * res_ref[1]
+    req_y <- 2 * res_ref[2]
+
+    left <- ext_inn[1] - ext_buf[1]
+    right <- ext_buf[2] - ext_inn[2]
+    bottom <- ext_inn[3] - ext_buf[3]
+    top <- ext_buf[4] - ext_inn[4]
+
+    if (left < req_x - 1e-9 ||
+        right < req_x - 1e-9 ||
+        bottom < req_y - 1e-9 ||
+        top < req_y - 1e-9) {
+      stop("缓冲区外扩不足 2 个像元")
+    }
+
+    message("✓ 缓冲区外扩满足要求")
+
+    list(
+      buffer_dem = buffer_dem,
+      inner_dem = inner_dem,
+      impervious = impervious,
+      drainage = drainage,
+      area_km2 = area_km2
+    )
+  }
+  #调用栅格检查函数
+  raster_checked <- check_rasters(
+    buffer_dem = buffer_dem,
+    inner_dem = inner_dem,
+    impervious = impervious,
+    drainage = drainage,
+    max_area_km2 = max_area_km2
+  )
+  #把处理后的栅格重新赋值：
+  buffer_dem <- raster_checked$buffer_dem
+  inner_dem <- raster_checked$inner_dem
+  impervious <- raster_checked$impervious
+  drainage <- raster_checked$drainage
+
+  # ---------------------------------------------------------------------------
+  # 3. 生成网格编号和计算区标记
+  # ---------------------------------------------------------------------------
+
+  grid_base_raw <- terra::as.data.frame(
+    buffer_dem,
+    xy = TRUE,
+    cells = TRUE,
+    na.rm = FALSE
+  )
+
+  dem_col <- setdiff(names(grid_base_raw), c("cell", "x", "y"))[1]
+
+  names(grid_base_raw)[names(grid_base_raw) == dem_col] <- "dem"
+  names(grid_base_raw)[names(grid_base_raw) == "x"] <- "lon"
+  names(grid_base_raw)[names(grid_base_raw) == "y"] <- "lat"
+
+  grid_base_raw$dem <- ifelse(is.na(grid_base_raw$dem), 0, grid_base_raw$dem)
+  grid_base_raw$grid_cell_id <- seq_len(nrow(grid_base_raw))
+
+  inner_vals <- terra::values(inner_dem, mat = FALSE)
+  grid_base_raw$grid_cell_type <- ifelse(
+    !is.na(inner_vals[grid_base_raw$cell]),
+    1L,
+    0L
+  )
+
+  # Keep an internal table with the original terra cell index for fast extraction.
+  grid_base_internal <- grid_base_raw[, c(
+    "cell",
+    "grid_cell_id",
+    "lon",
+    "lat",
+    "dem",
+    "grid_cell_type"
+  )]
+
+  # Public output table.
+  grid_base <- grid_base_internal[, c(
+    "grid_cell_id",
+    "lon",
+    "lat",
+    "dem",
+    "grid_cell_type"
+  )]
+
+  # Select computational-domain cells while preserving the original grid cell IDs.
+  inner <- grid_base_internal[
+    grid_base_internal$grid_cell_type == 1,
+    c("cell", "grid_cell_id", "lon", "lat")
+  ]
+
+  if (nrow(inner) == 0) {
+    stop("grid_base 中没有 grid_cell_type == 1 的计算区像元")
+  }
+
+  # ---------------------------------------------------------------------------
+  # 4. 生成降雨时间序列输入
+  # ---------------------------------------------------------------------------
+
+  if (!is.finite(max_hour_rain_mm) || max_hour_rain_mm <= 0) {
+    stop("max_hour_rain_mm 必须为大于 0 的有限数值")
+  }
+  if (!is.finite(event_duration_min) || event_duration_min <= 0) {
+    stop("event_duration_min 必须为大于 0 的有限数值")
+  }
+  if (!is.finite(dt) || dt <= 0) {
+    stop("dt 必须为大于 0 的有限数值")
+  }
+  if (!is_whole_multiple(event_duration_min, dt)) {
+    stop("event_duration_min 必须能被 dt 整除")
+  }
+  if (!is.finite(r) || r <= 0 || r >= 1) {
+    stop("r 必须在 0 到 1 之间，且不能等于 0 或 1")
+  }
+
+  if (!is.finite(A) || A <= 0) stop("A 必须为大于 0 的有限数值")
+  if (!is.finite(C) || C < 0) stop("C 必须为不小于 0 的有限数值")
+  if (!is.finite(b) || b <= 0) stop("b 必须为大于 0 的有限数值")
+  if (!is.finite(n) || n <= 0) stop("n 必须为大于 0 的有限数值")
+  if (!is.finite(P) || P <= 0) stop("P 必须为大于 0 的有限数值")
+
+  if (A < 1 || A > 10000) {
+    warning("A 数值偏离常见范围，请检查暴雨强度公式参数")
+  }
+
+  if (C > 5) {
+    warning("C 数值偏大，常见范围一般为 0~5")
+  }
+
+  if (b < 1 || b > 200) {
+    warning("b 数值偏离常见范围，常见范围一般为 1~200")
+  }
+
+  if (n < 0.3 || n > 1.5) {
+    warning("n 数值偏离常见范围，常见范围一般为 0.3~1.5")
+  }
+
+  if (A * (1 + C * log10(P)) <= 0) {
+    stop("A * (1 + C * log10(P)) 必须大于 0，请检查 A、C、P")
+  }
+
+  # 读取内置降雨空间权重栅格
+  rain_sum_path <- system.file("extdata", "rain_sum.tif", package = "uFood2d")
+  if (rain_sum_path == "") {
+    stop("内置 rain_sum.tif 未找到，请检查 uFood2d 包安装")
+  }
+  r_rain_sum <- terra::rast(rain_sum_path)
+  if (is.na(terra::crs(r_rain_sum)) || terra::crs(r_rain_sum) == "") {
+    stop("内置 rain_sum.tif 缺少 CRS")
+  }
+
+  # The inner coordinates come from the buffer DEM grid, so their CRS should
+  # first be defined as the buffer DEM CRS. If rain_sum uses another CRS, the
+  # points are then projected to the rain_sum CRS before extraction.
+  pts_rain <- terra::vect(
+    inner[, c("lon", "lat")],
+    geom = c("lon", "lat"),
+    crs = terra::crs(buffer_dem)
+  )
+
+  if (!terra::same.crs(pts_rain, r_rain_sum)) {
+    pts_rain <- terra::project(pts_rain, terra::crs(r_rain_sum))
+  }
+
+  rain_weight <- terra::extract(r_rain_sum, pts_rain)[, 2]
+  rain_weight <- ifelse(is.na(rain_weight), 0, rain_weight)
+
+  if (any(rain_weight < 0, na.rm = TRUE)) {
+    stop("降雨空间权重存在负值，请检查 rain_sum.tif")
+  }
+
+  if (sum(rain_weight, na.rm = TRUE) <= 0) {
+    stop("提取到的降雨空间权重总和为 0，请检查 rain_sum.tif 与计算区范围是否匹配")
+  }
+
+  # Normalize spatial rainfall weights by their mean so that the spatial average
+  # rainfall depth remains consistent with the target rainfall time series.
+  rain_factor <- rain_weight / mean(rain_weight, na.rm = TRUE)
+  inner$rain_factor <- rain_factor
+
+  # 生成芝加哥雨型时间序列
+  n_steps <- as.integer(round(event_duration_min / dt))
+  t_peak <- event_duration_min * r
+  times <- seq(dt, event_duration_min, by = dt)
+
+  rain_intensity <- vapply(times, function(t) {
+    A1 <- A * (1 + C * log10(P))
+
+    if (t <= t_peak) {
+      tp <- t_peak - t
+      A1 * ((1 - n) * tp / r + b) / ((tp / r + b)^(n + 1))
+    } else {
+      ta <- t - t_peak
+      A1 * ((1 - n) * ta / (1 - r) + b) /
+        ((ta / (1 - r) + b)^(n + 1))
+    }
+  }, numeric(1))
+
+  if (any(!is.finite(rain_intensity))) {
+    stop("芝加哥雨型计算得到非有限降雨强度，请检查暴雨强度公式参数")
+  }
+
+  if (any(rain_intensity < 0)) {
+    stop("芝加哥雨型计算得到负降雨强度，请检查 n、b、r 和降雨历时参数")
+  }
+
+  rain_mm <- rain_intensity * dt
+
+  if (sum(rain_mm) <= 0) {
+    stop("降雨时序总量为 0，请检查降雨参数")
+  }
+
+  # Scale the rainfall series to match the target accumulated rainfall depth.
+  # The current implementation assumes the target total rainfall is proportional
+  # to event duration based on the target one-hour rainfall amount.
+  total_target <- max_hour_rain_mm * (event_duration_min / 60)
+  scale_factor <- total_target / sum(rain_mm)
+  rain_mm <- rain_mm * scale_factor
+
+  rain_series <- data.frame(
+    time = times,
+    rain_mm = rain_mm,
+    stringsAsFactors = FALSE
+  )
+
+  # Allocate rainfall to each computational cell according to spatial factors.
+  rain_matrix <- outer(inner$rain_factor, rain_mm, `*`)
+  colnames(rain_matrix) <- paste0("pprain", seq_len(n_steps))
+
+  rain_spatial <- cbind(
+    inner["grid_cell_id"],
+    as.data.frame(rain_matrix)
+  )
+
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+
+  rain_file <- file.path(output_dir, paste0(prefix, "_rain.csv"))
+  utils::write.csv(rain_spatial, rain_file, row.names = FALSE)
+
+  message("降雨时序 CSV → ", rain_file)
+
+  # ---------------------------------------------------------------------------
+  # 5. 生成 Horton 下渗时间序列
+  # ---------------------------------------------------------------------------
+
+  if (!is.finite(f0) || !is.finite(fc) || !is.finite(k)) {
+    stop("Horton 下渗参数必须为有限数值")
+  }
+  if (f0 < fc) {
+    stop("f0 应 ≥ fc")
+  }
+  if (f0 < 0 || fc < 0 || k < 0) {
+    stop("下渗参数不能为负")
+  }
+
+  imperv_vals_all <- terra::values(impervious, mat = FALSE)
+  imperv_vals <- imperv_vals_all[inner$cell]
+  imperv_vals <- ifelse(is.na(imperv_vals), 0, imperv_vals)
+  imperv_vals <- pmin(pmax(imperv_vals, 0), 1)
+
+  # 计算 Horton 下渗率
+  time_h <- seq(dt, event_duration_min, by = dt) / 60
+  ft <- fc + (f0 - fc) * exp(-k * time_h)
+  inf_depth_mm <- ft * dt / 60
+
+  if (any(!is.finite(inf_depth_mm))) {
+    stop("Horton 下渗计算得到非有限值，请检查 f0、fc、k 和 dt")
+  }
+
+  # Cell-level infiltration depth equals the pervious fraction multiplied by
+  # the infiltration depth.
+  pervious <- 1 - imperv_vals
+  inf_matrix <- outer(pervious, inf_depth_mm, `*`)
+  colnames(inf_matrix) <- paste0("ppinf", seq_len(n_steps))
+
+  infiltration <- cbind(
+    inner["grid_cell_id"],
+    as.data.frame(inf_matrix)
+  )
+
+  inf_file <- file.path(output_dir, paste0(prefix, "_inf.csv"))
+  utils::write.csv(infiltration, inf_file, row.names = FALSE)
+
+  message("下渗时序 CSV → ", inf_file)
+
+  # ---------------------------------------------------------------------------
+  # 6. 生成排水能力输入
+  # ---------------------------------------------------------------------------
+
+  drainage_vals_all <- terra::values(drainage, mat = FALSE)
+  drainage_vals <- drainage_vals_all[grid_base_internal$cell]
+  drainage_vals <- ifelse(is.na(drainage_vals), 0, drainage_vals)
+  drainage_vals <- pmin(pmax(drainage_vals, 0), 1)
+
+  drainage_df <- cbind(
+    grid_base,
+    drainage = drainage_vals
+  )
+
+  drainage_file <- file.path(output_dir, paste0(prefix, "_drainage.csv"))
+  utils::write.csv(drainage_df, drainage_file, row.names = FALSE)
+
+  message("排水能力 CSV → ", drainage_file)
+
+  # ---------------------------------------------------------------------------
+  # 7. 生成初始模型状态表
+  # ---------------------------------------------------------------------------
+  required_cols <- c(
+    "grid_cell_id",
+    "lon",
+    "lat",
+    "dem",
+    "drainage",
+    "grid_cell_type"
+  )
+
+  if (!all(required_cols %in% names(drainage_df))) {
+    stop("初始状态表缺少必要字段")
+  }
+  if (!is.finite(dx) || dx <= 0) {
+    stop("dx 必须为大于 0 的有限数值")
+  }
+  if (!is.finite(dy) || dy <= 0) {
+    stop("dy 必须为大于 0 的有限数值")
+  }
+  if (!is.finite(h0) || h0 < 0) {
+    stop("h0 必须为非负有限数值")
+  }
+  state_tbl <- drainage_df
+
+  # Create the link column using the "lon_lat" format.
+  state_tbl$link <- paste0(state_tbl$lon, "_", state_tbl$lat)
+  state_tbl$dx <- dx
+  state_tbl$dy <- dy
+  state_tbl$water_depth <- h0
+  state_tbl$velocity_x <- 0
+  state_tbl$velocity_y <- 0
+
+  state_tbl <- tibble::as_tibble(state_tbl)
+
+  initial_file <- file.path(output_dir, paste0(prefix, "_state_tbl.csv"))
+  utils::write.csv(state_tbl, initial_file, row.names = FALSE)
+
+  message("初始状态 CSV → ", initial_file)
+
+  # ---------------------------------------------------------------------------
+  # Return all preprocessing outputs
+  # ---------------------------------------------------------------------------
+
+  return(list(
+    grid_base = grid_base,
+    rain_series = rain_series,
+    rain_spatial = rain_spatial,
+    infiltration = infiltration,
+    drainage = drainage_df,
+    state_tbl = state_tbl
+  ))
+}
