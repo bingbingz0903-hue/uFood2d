@@ -1,0 +1,91 @@
+#' Build a neighbor index table for computational grid cells
+#'
+#' Create a neighbor lookup table for all grid cells with
+#' \code{grid_cell_type == 1}. For each target cell, the function searches
+#' neighboring cells in a cross-shaped pattern centered on the current cell,
+#' including 1-cell and 2-cell offsets in the four cardinal directions.
+#'
+#' The output is typically used in CQ2D numerical computation to quickly
+#' retrieve adjacent or second-order adjacent grid cell IDs during flow routing,
+#' finite-difference calculation, or stencil-based updates.
+#'
+#' @param state_tbl A data frame or tibble generated from
+#'   \code{prepare_initial_state()}, containing at least the following columns:
+#'   \describe{
+#'     \item{grid_cell_id}{Unique ID of each grid cell}
+#'     \item{lon}{X coordinate of cell center}
+#'     \item{lat}{Y coordinate of cell center}
+#'     \item{link}{Character key in the format \code{"lon_lat"}}
+#'     \item{grid_cell_type}{Grid type flag; \code{1} indicates computational cells}
+#'   }
+#' @param dx Numeric. Grid spacing in the x direction (map units, usually meters).
+#'   Must be greater than 0.
+#' @param dy Numeric. Grid spacing in the y direction (map units, usually meters).
+#'   Must be greater than 0.
+#'
+#' @return A tibble with one row for each grid cell where
+#'   \code{grid_cell_type == 1}. The returned columns are:
+#'   \describe{
+#'     \item{grid_cell_id}{ID of the base grid cell}
+#'     \item{a}{Center cell ID (same as \code{grid_cell_id})}
+#'     \item{b}{Right neighbor at \code{(+dx, 0)}}
+#'     \item{c}{Down neighbor at \code{(0, -dy)}}
+#'     \item{d}{Left neighbor at \code{(-dx, 0)}}
+#'     \item{e}{Up neighbor at \code{(0, +dy)}}
+#'     \item{p}{Far-right neighbor at \code{(+2*dx, 0)}}
+#'     \item{q}{Far-down neighbor at \code{(0, -2*dy)}}
+#'     \item{m}{Far-left neighbor at \code{(-2*dx, 0)}}
+#'     \item{n}{Far-up neighbor at \code{(0, +2*dy)}}
+#'   }
+#'   If a neighbor does not exist at a given position, the corresponding value
+#'   is \code{NA}.
+#'
+#' @details
+#' Neighbor identification is based on string matching of the \code{link} field
+#' rather than spatial indexing. The \code{link} column must therefore be unique
+#' and follow the same coordinate concatenation rule used in
+#' \code{prepare_initial_state()}, i.e. \code{paste0(lon, "_", lat)}.
+#'
+#' Only cells with \code{grid_cell_type == 1} are used as base cells in the
+#' output table, but matched neighbors may belong to either computational cells
+#' or buffer cells, as long as they exist in \code{state_tbl}.
+#'
+#' For efficiency, the function first builds a named lookup vector from
+#' \code{link -> grid_cell_id}, then performs vectorized matching for each
+#' directional offset.
+#'
+#' @examples
+#' \dontrun{
+#' state <- prepare_initial_state(...)
+#' neighbors <- find_neighbors(state, dx = 90, dy = 90)
+#'
+#' # View the first few neighbor relations
+#' head(neighbors)
+#'
+#' # Inspect neighbors for one grid cell
+#' neighbors[1, ]
+#' }
+#'
+#' @seealso \code{\link{prepare_initial_state}}
+#' @export
+find_neighbors <- function(state_tbl, dx, dy ) {
+
+  offsets <- tibble::tibble(
+    key     = c("a","b","c","d","e","p","q","m","n"),
+    lon_off = c(0,  dx,  0, -dx, 0,  2*dx,  0, -2*dx, 0),
+    lat_off = c(0,   0, -dy,   0, dy,  0, -2*dy,   0, 2*dy)
+  )
+  base <- state_tbl %>%
+    dplyr::filter(grid_cell_type == 1) %>%
+    dplyr::select(grid_cell_id, lon, lat, link)
+  neigh_tbl <- base %>% dplyr::select(grid_cell_id)
+
+  for(i in seq_len(nrow(offsets))){
+    off <- offsets[i, ]
+    neigh_key <- paste0(base$lon + off$lon_off, "_", base$lat + off$lat_off)
+    neigh_id <- state_tbl$grid_cell_id[ match(neigh_key, state_tbl$link) ]
+    neigh_tbl[[ off$key ]] <- neigh_id
+  }
+
+  return(neigh_tbl)
+}
