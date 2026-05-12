@@ -1,0 +1,308 @@
+#' Execute complete shallow water simulation with time-varying forcing
+#'
+#' This function runs a full shallow water simulation over a specified time
+#' period, applying spatially distributed and temporally varying rainfall and
+#' infiltration rates. Model state is saved to CSV files at each time step.
+#'
+#' @param state_tbl Tibble or data frame containing initial model state.
+#' @param neigh_tbl Tibble or data frame containing neighbor relationships.
+#' @param dx Numeric. Grid cell size in x-direction, unit m.
+#' @param dy Numeric. Grid cell size in y-direction, unit m.
+#' @param dt Numeric. Time step size, unit min.
+#' @param event_duration_min Numeric. Total simulation time, unit min.
+#' @param rain_series Data frame containing grid_cell_id and pprain1, pprain2, ...
+#' @param infil_series Data frame containing grid_cell_id and ppinf1, ppinf2, ...
+#' @param g Numeric. Gravitational acceleration. Unit should be consistent with dt.
+#' @param n Numeric. Manning's roughness coefficient.
+#' @param h_min Numeric. Minimum water depth threshold, unit m.
+#' @param forcing_unit Character. Unit type of rainfall and infiltration inputs.
+#'   Use "depth_mm_per_step" if pprain/ppinf are mm per time step.
+#'   Use "rate_mm_per_min" if pprain/ppinf are already mm/min.
+#' @param parallel Logical. Whether to use parallel processing.
+#' @param n_cores Integer. Number of CPU cores for parallel computation.
+#' @param output_dir Character. Directory path for output files.
+#' @param file_prefix Character. Prefix for output filenames.
+#' @param pad_width Integer. Number of digits for zero-padding time step numbers.
+#'
+#' @return Final model state after all time steps.
+#'
+#' @export
+run_model <- function(state_tbl,
+                      neigh_tbl,
+                      dx,
+                      dy,
+                      dt,
+                      event_duration_min,
+                      rain_series = NULL,
+                      infil_series = NULL,
+                      g,
+                      n,
+                      h_min,
+                      forcing_unit = c("depth_mm_per_step", "rate_mm_per_min"),
+                      parallel = FALSE,
+                      n_cores = NULL,
+                      output_dir = ".",
+                      file_prefix = "s",
+                      pad_width = 6) {
+  
+  forcing_unit <- match.arg(forcing_unit)
+  
+  # -----------------------------
+  # 1. Basic parameter checks
+  # -----------------------------
+  if (!is.numeric(dx) || length(dx) != 1 || dx <= 0) {
+    stop("dx must be a positive numeric value.")
+  }
+  
+  if (!is.numeric(dy) || length(dy) != 1 || dy <= 0) {
+    stop("dy must be a positive numeric value.")
+  }
+  
+  if (!is.numeric(dt) || length(dt) != 1 || dt <= 0) {
+    stop("dt must be a positive numeric value.")
+  }
+  
+  if (!is.numeric(event_duration_min) ||
+      length(event_duration_min) != 1 ||
+      event_duration_min < 0) {
+    stop("event_duration_min must be a non-negative numeric value.")
+  }
+  
+  if (!is.numeric(g) || length(g) != 1) {
+    stop("g must be a numeric value.")
+  }
+  
+  if (!is.numeric(n) || length(n) != 1 || n <= 0) {
+    stop("n must be a positive numeric Manning roughness coefficient.")
+  }
+  
+  if (!is.numeric(h_min) || length(h_min) != 1 || h_min < 0) {
+    stop("h_min must be a non-negative numeric value.")
+  }
+  
+  if (is.null(n_cores)) {
+    detected_cores <- parallel::detectCores()
+    
+    if (is.na(detected_cores)) {
+      detected_cores <- 1L
+    }
+    
+    n_cores <- max(1L, detected_cores - 1L)
+  }
+  
+  n_cores <- as.integer(n_cores)
+  
+  if (n_cores < 1L) {
+    stop("n_cores must be at least 1.")
+  }
+  
+  # -----------------------------
+  # 2. Check required columns
+  # -----------------------------
+  required_state_cols <- c(
+    "grid_cell_id",
+    "water_depth",
+    "velocity_x",
+    "velocity_y",
+    "dem",
+    "drainage",
+    "grid_cell_type"
+  )
+  
+  missing_state_cols <- setdiff(required_state_cols, names(state_tbl))
+  
+  if (length(missing_state_cols) > 0) {
+    stop(
+      "state_tbl is missing required columns: ",
+      paste(missing_state_cols, collapse = ", ")
+    )
+  }
+  
+  required_neigh_cols <- c(
+    "grid_cell_id", "a", "b", "c", "d", "e", "p", "q", "m", "n"
+  )
+  
+  missing_neigh_cols <- setdiff(required_neigh_cols, names(neigh_tbl))
+  
+  if (length(missing_neigh_cols) > 0) {
+    stop(
+      "neigh_tbl is missing required columns: ",
+      paste(missing_neigh_cols, collapse = ", ")
+    )
+  }
+  
+  if (anyDuplicated(state_tbl$grid_cell_id)) {
+    stop("state_tbl$grid_cell_id contains duplicated values.")
+  }
+  
+  # -----------------------------
+  # 3. Initialize r and i columns
+  # -----------------------------
+  if (!"r" %in% names(state_tbl)) {
+    state_tbl$r <- 0
+  }
+  
+  if (!"i" %in% names(state_tbl)) {
+    state_tbl$i <- 0
+  }
+  
+  NT <- ceiling(event_duration_min / dt)
+  
+  if (NT == 0) {
+    return(state_tbl)
+  }
+  
+  if (!isTRUE(all.equal(NT * dt, event_duration_min))) {
+    warning(
+      "event_duration_min is not exactly divisible by dt. ",
+      "The simulation will run for ", NT * dt, " minutes."
+    )
+  }
+  
+  ncell <- nrow(state_tbl)
+  
+  # -----------------------------
+  # 4. Prepare output directory
+  # -----------------------------
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  
+  # -----------------------------
+  # 5. Helper function for forcing table
+  # -----------------------------
+  prepare_forcing <- function(series, prefix, series_name) {
+    if (is.null(series)) {
+      return(NULL)
+    }
+    
+    if (!"grid_cell_id" %in% names(series)) {
+      stop(series_name, " must contain a grid_cell_id column.")
+    }
+    
+    if (anyDuplicated(series$grid_cell_id)) {
+      stop(series_name, "$grid_cell_id contains duplicated values.")
+    }
+    
+    forcing_cols <- paste0(prefix, seq_len(NT))
+    missing_cols <- setdiff(forcing_cols, names(series))
+    
+    if (length(missing_cols) > 0) {
+      stop(
+        series_name, " is missing required columns: ",
+        paste(missing_cols, collapse = ", ")
+      )
+    }
+    
+    non_numeric_cols <- forcing_cols[
+      !vapply(series[forcing_cols], is.numeric, logical(1))
+    ]
+    
+    if (length(non_numeric_cols) > 0) {
+      stop(
+        series_name, " contains non-numeric forcing columns: ",
+        paste(non_numeric_cols, collapse = ", ")
+      )
+    }
+    
+    match_index <- match(state_tbl$grid_cell_id, series$grid_cell_id)
+    
+    if (any(is.na(match_index))) {
+      warning(
+        series_name,
+        " does not contain all grid_cell_id values in state_tbl. ",
+        "Missing cells will use zero forcing."
+      )
+    }
+    
+    list(
+      data = series,
+      cols = forcing_cols,
+      match_index = match_index
+    )
+  }
+  
+  rain_info <- prepare_forcing(
+    series = rain_series,
+    prefix = "pprain",
+    series_name = "rain_series"
+  )
+  
+  infil_info <- prepare_forcing(
+    series = infil_series,
+    prefix = "ppinf",
+    series_name = "infil_series"
+  )
+  
+  # -----------------------------
+  # 6. Unit conversion helper
+  # -----------------------------
+  convert_forcing_to_m_per_min <- function(x) {
+    if (forcing_unit == "depth_mm_per_step") {
+      return(x / 1000 / dt)
+    }
+    
+    if (forcing_unit == "rate_mm_per_min") {
+      return(x / 1000)
+    }
+  }
+  
+  # -----------------------------
+  # 7. Main simulation loop
+  # -----------------------------
+  for (t in seq_len(NT)) {
+    
+    # Rainfall forcing
+    if (is.null(rain_info)) {
+      state_tbl$r <- rep(0, ncell)
+    } else {
+      r_raw <- rain_info$data[[rain_info$cols[t]]][rain_info$match_index]
+      r_raw[is.na(r_raw)] <- 0
+      state_tbl$r <- convert_forcing_to_m_per_min(r_raw)
+    }
+    
+    # Infiltration forcing
+    if (is.null(infil_info)) {
+      state_tbl$i <- rep(0, ncell)
+    } else {
+      i_raw <- infil_info$data[[infil_info$cols[t]]][infil_info$match_index]
+      i_raw[is.na(i_raw)] <- 0
+      state_tbl$i <- convert_forcing_to_m_per_min(i_raw)
+    }
+    
+    # Advance model by one time step
+    state_tbl <- step_model(
+      state_tbl = state_tbl,
+      neigh_tbl = neigh_tbl,
+      dx = dx,
+      dy = dy,
+      dt = dt,
+      g = g,
+      n = n,
+      h_min = h_min,
+      parallel = parallel,
+      n_cores = n_cores
+    )
+    
+    # Write output
+    out_path <- file.path(
+      output_dir,
+      sprintf("%s_t%0*d.csv", file_prefix, pad_width, t)
+    )
+    
+    utils::write.table(
+      state_tbl[, c(
+        "grid_cell_id",
+        "water_depth",
+        "velocity_x",
+        "velocity_y"
+      )],
+      file = out_path,
+      sep = ",",
+      row.names = FALSE,
+      col.names = TRUE
+    )
+  }
+  
+  state_tbl
+}
