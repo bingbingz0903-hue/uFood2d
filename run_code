@@ -1,0 +1,173 @@
+#安装包，只安装一次
+install.packages(
+  "F:/xyt/R_package/uFood2d_0.1.0.tar.gz",      ###修改安装包所在的实际路径
+  repos = NULL,
+  type = "source"
+)
+
+# 1. 加载必备包
+library(tidyverse)
+library(terra)
+library(parallel)
+library(uFood2d)
+
+# 2. 设置工作目录、读取栅格文件
+setwd("F:/xyt/R_package/")         ###修改为实际工作路径
+
+city_config <- tibble::tribble(
+  ~city_id, ~buffer_dem, ~inner_dem, ~impervious, ~drainage,
+  1,                              ###修改：定义要处理的城市编号
+  "buffer_dem.tif",               ###修改：实际路径
+  "inner_dem.tif",                ###修改：实际路径
+  "impervious.tif",               ###修改：实际路径
+  "drainage.tif"                  ###修改：实际路径
+)
+
+# 3. 定义物理参数（根据情景设计自行修改）
+dx <- 90                 # 网格x方向分辨率，m
+dy <- 90                 # 网格y方向分辨率,m
+dt <- 1                  # 时间步长,min
+event_duration_min <- 60 # 降雨事件持续时间,min
+g <- 9.81                # 重力加速度
+manning_n <- 0.012       # 曼宁糙率
+h_min <- 1e-10           # 最小水深阈值，m
+h0 <- 1e-6               # 初始水深，m
+  
+  use_parallel <- TRUE   # 是否启用并行计算
+  n_cores <- 6
+
+# 4. 降雨模拟参数（可根据情景修改）
+rain_params <- list(
+  max_hour_rain_mm = 100,   # 一小时目标降雨量 mm
+  rain_peak_r      = 0.4,   # 雨峰位置系数 (0 < r < 1)
+  A                = 167,
+  C                = 0.8,
+  b                = 10,
+  n                = 0.65,
+  P                = 20
+)
+
+# 5. 土壤下渗模拟参数（可根据情景修改）
+infil_params <- list(
+  f0 = 20,      # 初始下渗率，mm/h
+  fc = 3,       # 稳定下渗率，mm/h
+  k  = 2        # 衰减系数，h^-1
+)
+
+# 6. 批量运行城市模拟
+for (ii in seq_len(nrow(city_config))) {
+  
+  city_id <- city_config$city_id[ii]
+  
+  cat("\n============================================================\n")
+  cat("正在处理城市：", city_id, "\n")
+  cat("============================================================\n")
+  
+  # -----------------------------
+  # 6.1 读取四类核心栅格数据
+  input_files <- city_config[ii, c("buffer_dem", "inner_dem", "impervious", "drainage")] %>% unlist()
+  names(input_files) <- c("buffer_dem_file", "inner_dem_file", "imperv_file", "drainage_file")
+  
+  # 检查文件完整性
+  missing_files <- input_files[!file.exists(input_files)]
+  if (length(missing_files) > 0) {
+    stop("城市 ", city_id, " 缺失输入文件：\n", paste(missing_files, collapse = "\n"))
+  }
+  buffer_dem_file <- input_files["buffer_dem_file"]
+  inner_dem_file  <- input_files["inner_dem_file"]
+  imperv_file     <- input_files["imperv_file"]
+  drainage_file   <- input_files["drainage_file"]
+  
+  # 6.2 设置输出目录
+  preprocess_dir <- file.path("output", paste0("city_", city_id), "preprocess")
+  simulation_dir <- file.path("output", paste0("city_", city_id), "simulation")
+  dir.create(preprocess_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(simulation_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  cat("预处理输出目录：", preprocess_dir, "\n")
+  cat("模拟结果输出目录：", simulation_dir, "\n")
+  
+  # 6.3 预处理：生成初始状态、降雨、下渗和排水输入
+  prep <- prepare_state(
+    buffer_dem = buffer_dem_file,
+    inner_dem = inner_dem_file,
+    impervious = imperv_file,
+    drainage = drainage_file,
+    
+    max_area_km2 = 5500,
+    
+    max_hour_rain_mm = rain_params$max_hour_rain_mm,
+    event_duration_min = event_duration_min,
+    dt = dt,
+    
+    r = rain_params$rain_peak_r,
+    A = rain_params$A,
+    C = rain_params$C,
+    b = rain_params$b,
+    n = rain_params$n,
+    P = rain_params$P,
+    
+    f0 = infil_params$f0,
+    fc = infil_params$fc,
+    k = infil_params$k,
+    
+    dx = dx,
+    dy = dy,
+    h0 = h0,
+    
+    output_dir = preprocess_dir,
+    prefix = paste0("city_", city_id)
+  )
+  
+  initial_state <- prep$state_tbl
+  rain_series   <- prep$rain_spatial
+  infil_series  <- prep$infiltration
+  
+  cat("预处理完成：", city_id, "\n")
+  cat("初始状态像元数：", nrow(initial_state), "\n")
+  cat("计算区像元数：", sum(initial_state$grid_cell_type == 1), "\n")
+  
+  # 6.4 构建邻居表
+  neighbor_table <- find_neighbors(
+    state_tbl = initial_state,
+    dx = dx,
+    dy = dy
+  )
+  
+  cat("邻居表构建完成：", nrow(neighbor_table), " 个计算单元\n")
+  
+  # 6.5 执行城市内涝模拟
+  final_state <- run_model(
+    state_tbl = initial_state,
+    neigh_tbl = neighbor_table,
+    
+    dx = dx,
+    dy = dy,
+    dt = dt,
+    event_duration_min = event_duration_min,
+    
+    rain_series = rain_series,
+    infil_series = infil_series,
+    
+    g = g,
+    n = manning_n,
+    h_min = h_min,
+    
+    forcing_unit = "depth_mm_per_step",
+    
+    parallel = use_parallel,
+    n_cores = n_cores,
+    
+    output_dir = simulation_dir,
+    file_prefix = paste0("city_", city_id),
+    pad_width = 3
+  )
+  
+  # 6.6 保存最终状态
+  final_state_file <- file.path(simulation_dir, paste0("city_", city_id, "_final_state.csv"))
+  readr::write_csv(final_state, final_state_file)
+  
+  cat("城市 ", city_id, " 模拟完成！\n", sep = "")
+  cat("最终状态文件：", final_state_file, "\n")
+  cat("============================================================\n")
+}
