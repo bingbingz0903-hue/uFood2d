@@ -1,2 +1,2 @@
 # uFood2d
-Initial commit for uFood2d R package
+Provides a high-resolution spatiotemporal simulation framework for urban pluvial flooding based on the two-dimensional shallow-water equations. The package supports raster-based data preprocessing, rainfall and Horton infiltration time-series generation, drainage-capacity extraction, neighbor index construction, finite-volume hydrodynamic updating, time-step model propagation, parallel computation, and CSV-based simulation result output. It is designed for urban flood process analysis, drainage-impact assessment, and spatiotemporal water-depth and velocity simulation over structured raster grids.
